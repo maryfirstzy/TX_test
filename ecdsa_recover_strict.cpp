@@ -40,8 +40,7 @@ g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
 
 using namespace std;
 
-#include <boost/multiprecision/cpp_int.hpp>
-using boost::multiprecision::cpp_int;
+
 
 #include <filesystem>
 namespace fs = std::filesystem;
