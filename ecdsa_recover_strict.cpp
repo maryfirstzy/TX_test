@@ -31,7 +31,7 @@ g++ -O3 -march=native -flto -fexceptions -pthread -std=c++17 \
 
 */
 
-#include <bits/stdc++.h>
+
 #include <secp256k1.h>
 #include <openssl/sha.h>
 #include <openssl/bn.h>
