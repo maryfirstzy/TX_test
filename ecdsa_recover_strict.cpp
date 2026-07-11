@@ -1,6 +1,10 @@
-cat << 'EOF' > ecdsa_recover_strict.cpp
-// ecdsa_recover_strict.cpp
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <cctype>
+#include <cstdlib>
 #include <secp256k1.h>
 #include <openssl/sha.h>
 #include <openssl/bn.h>
@@ -38,7 +42,7 @@ static string to_hex(const unsigned char* p, size_t n){
     return s;
 }
 
-static void sha256_once(const unsigned char* in, size_t len, unsigned char out[32]){
+static void sha256_once(const unsigned char* in, size_t len, unsigned char* out){
     SHA256_CTX c;
     SHA256_Init(&c);
     SHA256_Update(&c, in, len);
@@ -223,7 +227,6 @@ static void process_signatures(const Config& cfg) {
         if (!bn_from_hex(sd.r, r_bn.n) || !bn_from_hex(sd.s, s_bn.n) || !bn_from_hex(sd.msg, msg_bn.n)) {
             continue; 
         }
-        // Arithmetic evaluation logic loop goes here
     }
     secp256k1_context_destroy(secp_ctx);
 }
@@ -259,4 +262,3 @@ int main(int argc, char* argv[]) {
     process_signatures(cfg);
     return 0;
 }
-EOF
