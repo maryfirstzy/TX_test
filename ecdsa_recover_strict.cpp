@@ -138,7 +138,7 @@ static void run_lcg(const SignatureEntry& e1, const BIGNUM* e1_r, const BIGNUM* 
     }
 }
 
-void execution_worker(int thread_id, const vector<SignatureEntry>& entries, int max_iter, long long dg_max_delta, const vector<long long>& dg_seeds, int dg_fill_step, int dg_per_pair_cap, long long lcg_a_max, long long lcg_b_max, int lcg_per_pair_cap, int scan_rand_k) {
+void execution_worker(int thread_id, const vector<SignatureEntry>& entries, int max_iter, long long dg_max_delta, const vector<long long>& dg_seeds, int dg_fill_step, int dg_per_pair_cap, long long lcg_a_max, long long lcg_b_max, int lcg_per_pair_cap, int scan_rand_k) }
     BN_CTX* ctx = BN_CTX_new(); BIGNUM* N = BN_new(); BN_hex2bn(&N, N_HEX);
     BIGNUM *top = BN_new(), *bot = BN_new(), *bot_inv = BN_new(), *k_sol = BN_new(), *r_ratio = BN_new(), *e2_r_inv = BN_new();
     BIGNUM *num = BN_new(), *den = BN_new(), *den_inv = BN_new(), *tmp = BN_new(), *target_k_delta = BN_new(), *bn_a = BN_new(), *bn_b = BN_new();
