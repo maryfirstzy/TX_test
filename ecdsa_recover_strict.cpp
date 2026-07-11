@@ -10,11 +10,9 @@
 #include <openssl/bn.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
-#include <boost/multiprecision/cpp_int.hpp>
 #include <filesystem>
 
 using namespace std;
-using boost::multiprecision::cpp_int;
 namespace fs = std::filesystem;
 
 static const char* N_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
